@@ -201,6 +201,7 @@ h2 {
 }
 
 .panel-heading h2 {
+  min-width: 0;
   max-width: 55vw;
   margin: 0;
   overflow: hidden;
@@ -214,9 +215,11 @@ h2 {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .source-select {
+  min-width: 0;
   max-width: 280px;
   padding: 6px 26px 6px 8px;
   border: 1px solid #343331;
@@ -881,6 +884,34 @@ footer {
     padding: 16px;
   }
 
+  .panel-heading {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .panel-heading > div:first-child,
+  .source-heading {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .source-heading {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .panel-heading h2,
+  .source-select {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .live-indicator {
+    flex: 0 0 auto;
+    padding-top: 18px;
+  }
+
   .transport {
     flex-wrap: wrap;
   }
@@ -891,12 +922,60 @@ footer {
     flex-basis: 100%;
   }
 
-  .sampler-pad {
-    min-height: 235px;
+  .pad-slot .sampler-pad {
+    min-height: 104px;
+    padding: 14px;
+    border-bottom-width: 5px;
   }
 
-  .pad-slot .sampler-pad {
-    min-height: 155px;
+  .pad-slot .sampler-pad:active,
+  .pad-slot .sampler-pad.capturing,
+  .pad-slot .sampler-pad.performing {
+    transform: translateY(3px);
+    border-bottom-width: 2px;
+  }
+
+  .pad-number,
+  .pad-state {
+    top: 12px;
+  }
+
+  .pad-number {
+    left: 13px;
+  }
+
+  .pad-state {
+    right: 13px;
+    font-size: 0.52rem;
+  }
+
+  .sampler-pad kbd {
+    right: 11px;
+    bottom: 9px;
+    width: 20px;
+    height: 20px;
+    font-size: 0.57rem;
+  }
+
+  .pad-slot .sampler-pad strong {
+    font-size: 0.82rem;
+  }
+
+  .pad-slot .sample-meta div {
+    padding: 6px;
+  }
+
+  .pad-utility-row {
+    margin-top: 4px;
+  }
+
+  .loop-toggle {
+    padding: 4px 5px;
+  }
+
+  .pad-grid {
+    gap: 7px;
+    margin-top: 12px;
   }
 
   .latency-panel {
@@ -909,12 +988,49 @@ footer {
 }
 
 @media (max-width: 420px) {
-  .pad-grid {
-    grid-template-columns: 1fr;
+  .topbar {
+    gap: 8px;
   }
 
-  .pad-slot .sampler-pad {
-    min-height: 165px;
+  .brand-lockup {
+    gap: 8px;
+  }
+
+  .brand-mark {
+    width: 36px;
+  }
+
+  .eyebrow {
+    display: none;
+  }
+
+  .file-picker {
+    flex: 0 0 auto;
+  }
+
+  .monitor-panel,
+  .control-panel {
+    padding: 12px;
+  }
+
+  .instruction-block p:last-child {
+    display: none;
+  }
+
+  .metronome-panel {
+    margin-top: 12px;
+  }
+
+  .sample-source-name {
+    display: none;
+  }
+
+  .pad-utility-row {
+    justify-content: flex-end;
+  }
+
+  .status-line {
+    margin-top: 8px;
   }
 }
 

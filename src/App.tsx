@@ -506,28 +506,38 @@ function App() {
 
       const generation = ++triggerGenerationRefs.current[padIndex];
       cancelPadVideoCallbacks(padIndex);
-      const context = await initializeAudioContext();
-      if (!context || generation !== triggerGenerationRefs.current[padIndex]) return;
+      // Keep the media play request in the original pointer/key event turn.
+      // Mobile browsers can reject a second pad when we await AudioContext.resume()
+      // before calling play(), because the transient user activation is then lost.
+      const audioInitialization = initializeAudioContext();
+      if (generation !== triggerGenerationRefs.current[padIndex]) return;
 
       video.pause();
       if (video.src !== source.url) {
         video.src = source.url;
         video.load();
       }
-      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-        await new Promise<void>((resolve) => {
-          video.addEventListener("loadedmetadata", () => resolve(), { once: true });
-          video.addEventListener("error", () => resolve(), {
-            once: true,
-          });
-        });
+
+      const metadataReady =
+        video.readyState >= HTMLMediaElement.HAVE_METADATA
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => {
+              video.addEventListener(
+                "loadedmetadata",
+                () => {
+                  if (generation === triggerGenerationRefs.current[padIndex]) {
+                    video.currentTime = sample.inSeconds;
+                  }
+                  resolve();
+                },
+                { once: true },
+              );
+              video.addEventListener("error", () => resolve(), { once: true });
+            });
+
+      if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        video.currentTime = sample.inSeconds;
       }
-      if (generation !== triggerGenerationRefs.current[padIndex]) return;
-      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-        setStatus(`${padLabel(padIndex)}의 소스 영상을 불러오지 못했습니다.`);
-        return;
-      }
-      video.currentTime = sample.inSeconds;
       setActivePad(padIndex);
       setLastLatencyPad(padIndex);
 
@@ -549,8 +559,17 @@ function App() {
       }
 
       try {
-        await video.play();
+        // Invoke play() before awaiting metadata so mobile Safari/Chrome still
+        // associate every finger press with its own media playback request.
+        const playRequest = video.play();
+        await Promise.all([playRequest, audioInitialization, metadataReady]);
         if (generation !== triggerGenerationRefs.current[padIndex]) return;
+        if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+          video.pause();
+          setIsPerforming((current) => replaceAt(current, padIndex, false));
+          setStatus(`${padLabel(padIndex)}의 소스 영상을 불러오지 못했습니다.`);
+          return;
+        }
         setLatency((current) => ({
           ...current,
           playPromiseMs: performance.now() - inputAt,
@@ -655,9 +674,14 @@ function App() {
     padIndex: PadIndex,
   ) => {
     event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    if (mode === "sample") startCapture(padIndex);
-    else void triggerSample(padIndex);
+    if (mode === "sample") {
+      event.currentTarget.setPointerCapture(event.pointerId);
+      startCapture(padIndex);
+    } else {
+      // Pointer capture is only needed for hold-to-sample. Avoiding it while
+      // performing lets separate fingers trigger separate pads independently.
+      void triggerSample(padIndex);
+    }
   };
 
   const handlePadPointerUp = (
@@ -665,7 +689,10 @@ function App() {
     padIndex: PadIndex,
   ) => {
     event.preventDefault();
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+    if (
+      mode === "sample" &&
+      event.currentTarget.hasPointerCapture(event.pointerId)
+    ) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     if (mode === "sample") finishCapture(padIndex);
