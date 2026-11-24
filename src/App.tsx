@@ -5,6 +5,7 @@ import {
   useState,
   type ChangeEvent,
   type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
 } from "react";
 import {
   MIN_SAMPLE_SECONDS,
@@ -16,40 +17,28 @@ import {
   type SamplerMode,
   type VideoSample,
 } from "./sampler";
+import {
+  PAD_INDICES,
+  PAD_KEY_CODES,
+  createPadValues,
+  padLabel,
+  replaceAt,
+  type PadIndex,
+  type SourceAsset,
+} from "./samplerUi";
+import { usePerformanceRecorder } from "./hooks/usePerformanceRecorder";
+import { useMetronome } from "./hooks/useMetronome";
+import { MonitorPanel } from "./components/MonitorPanel";
+import { ControlPanel } from "./components/ControlPanel";
 
 type AudioContextWithLatency = AudioContext & { outputLatency?: number };
-type PadIndex = 0 | 1 | 2 | 3;
 type UndoEntry = { padIndex: PadIndex; previousSample: VideoSample };
-type SourceAsset = { id: string; name: string; url: string };
-
-const PAD_INDICES: PadIndex[] = [0, 1, 2, 3];
-const PAD_KEYS = ["A", "S", "D", "F"] as const;
-const PAD_KEY_CODES: Record<string, PadIndex> = {
-  KeyA: 0,
-  KeyS: 1,
-  KeyD: 2,
-  KeyF: 3,
-};
 const EMPTY_LATENCY: LatencyReading = {
   playPromiseMs: null,
   firstFrameMs: null,
   audioBaseMs: null,
   audioOutputMs: null,
 };
-
-function createPadValues<T>(value: T): T[] {
-  return PAD_INDICES.map(() => value);
-}
-
-function replaceAt<T>(values: readonly T[], index: PadIndex, value: T): T[] {
-  const next = [...values];
-  next[index] = value;
-  return next;
-}
-
-function padLabel(index: PadIndex): string {
-  return `PAD ${String(index + 1).padStart(2, "0")}`;
-}
 
 function App() {
   const sourceVideoRef = useRef<HTMLVideoElement>(null);
@@ -58,9 +47,10 @@ function App() {
   );
   const sourceAssetsRef = useRef<SourceAsset[]>([]);
   const audioContextRef = useRef<AudioContextWithLatency | null>(null);
-  const performanceAudioSourceRefs = useRef<Array<MediaElementAudioSourceNode | null>>(
+  const performanceAudioSourceRefs = useRef<Array<AudioBufferSourceNode | null>>(
     createPadValues(null),
   );
+  const metronomeRecordingConnectedRef = useRef(false);
   const captureStartRefs = useRef<Array<number | null>>(createPadValues(null));
   const stopFrameRequestRefs = useRef<Array<number | null>>(createPadValues(null));
   const latencyFrameRequestRefs = useRef<Array<number | null>>(createPadValues(null));
@@ -69,13 +59,7 @@ function App() {
   const undoEntryRef = useRef<UndoEntry | null>(null);
   const loopEnabledRefs = useRef<boolean[]>(createPadValues(false));
 
-  const metronomeRunningRef = useRef(false);
-  const metronomeSchedulerRef = useRef<number | null>(null);
-  const metronomeVisualTimersRef = useRef<number[]>([]);
   const metronomeGainRef = useRef<GainNode | null>(null);
-  const metronomeNextTimeRef = useRef(0);
-  const metronomeNextBeatRef = useRef(0);
-  const bpmRef = useRef(120);
 
   const [mode, setMode] = useState<SamplerMode>("sample");
   const [sources, setSources] = useState<SourceAsset[]>([]);
@@ -94,18 +78,28 @@ function App() {
   const [status, setStatus] = useState("먼저 로컬 영상을 불러오세요.");
   const [latency, setLatency] = useState<LatencyReading>(EMPTY_LATENCY);
   const [lastLatencyPad, setLastLatencyPad] = useState<PadIndex | null>(null);
-  const [bpm, setBpm] = useState(120);
-  const [isMetronomeOn, setIsMetronomeOn] = useState(false);
-  const [metronomeBeat, setMetronomeBeat] = useState<number | null>(null);
 
   const activeSource =
     sources.find((source) => source.id === activeSourceId) ?? null;
   const sourceUrl = activeSource?.url ?? null;
   const sourceName = activeSource?.name ?? "";
 
-  useEffect(() => {
-    bpmRef.current = bpm;
-  }, [bpm]);
+  const stopPadAudio = useCallback((padIndex: PadIndex) => {
+    const source = performanceAudioSourceRefs.current[padIndex];
+    if (!source) return;
+    source.onended = null;
+    try {
+      source.stop();
+    } catch {
+      // The node may already have reached its scheduled end.
+    }
+    source.disconnect();
+    performanceAudioSourceRefs.current[padIndex] = null;
+  }, []);
+
+  const stopAllPadAudio = useCallback(() => {
+    PAD_INDICES.forEach(stopPadAudio);
+  }, [stopPadAudio]);
 
   const cancelPadVideoCallbacks = useCallback((padIndex: PadIndex) => {
     const video = performanceVideoRefs.current[padIndex];
@@ -155,33 +149,14 @@ function App() {
     sourceAssetsRef.current = [];
   }, []);
 
-  const silenceMetronome = useCallback(() => {
-    metronomeRunningRef.current = false;
-    if (metronomeSchedulerRef.current !== null) {
-      window.clearTimeout(metronomeSchedulerRef.current);
-      metronomeSchedulerRef.current = null;
-    }
-    metronomeVisualTimersRef.current.forEach(window.clearTimeout);
-    metronomeVisualTimersRef.current = [];
-
-    const context = audioContextRef.current;
-    const master = metronomeGainRef.current;
-    if (context && master) {
-      master.gain.cancelScheduledValues(context.currentTime);
-      master.gain.setValueAtTime(0, context.currentTime);
-      master.disconnect();
-    }
-    metronomeGainRef.current = null;
-  }, []);
-
   useEffect(() => {
     return () => {
       cancelAllVideoCallbacks();
-      silenceMetronome();
+      stopAllPadAudio();
       releaseSourceUrls();
       void audioContextRef.current?.close();
     };
-  }, [cancelAllVideoCallbacks, releaseSourceUrls, silenceMetronome]);
+  }, [cancelAllVideoCallbacks, releaseSourceUrls, stopAllPadAudio]);
 
   const initializeAudioContext = useCallback(async () => {
     const Context = window.AudioContext;
@@ -191,14 +166,6 @@ function App() {
     }
 
     const context = audioContextRef.current;
-    PAD_INDICES.forEach((padIndex) => {
-      const video = performanceVideoRefs.current[padIndex];
-      if (!video || performanceAudioSourceRefs.current[padIndex]) return;
-      const source = context.createMediaElementSource(video);
-      source.connect(context.destination);
-      performanceAudioSourceRefs.current[padIndex] = source;
-    });
-
     if (context.state === "suspended") await context.resume();
     setLatency((current) => ({
       ...current,
@@ -212,70 +179,54 @@ function App() {
     return context;
   }, []);
 
-  const stopMetronome = useCallback(() => {
-    silenceMetronome();
-    setIsMetronomeOn(false);
-    setMetronomeBeat(null);
-    setStatus("메트로놈을 정지했습니다.");
-  }, [silenceMetronome]);
+  const ensureSourceAudio = useCallback(
+    (source: SourceAsset, context: AudioContext): Promise<AudioBuffer | null> => {
+      if (source.audioBuffer) return Promise.resolve(source.audioBuffer);
+      if (source.audioDecodePromise) return source.audioDecodePromise;
 
-  const startMetronome = useCallback(async () => {
-    const context = await initializeAudioContext();
-    if (!context || metronomeRunningRef.current) return;
+      source.audioDecodePromise = source.file
+        .arrayBuffer()
+        .then((data) => context.decodeAudioData(data))
+        .then((buffer) => {
+          source.audioBuffer = buffer;
+          return buffer;
+        })
+        .catch(() => null);
+      return source.audioDecodePromise;
+    },
+    [],
+  );
 
-    const master = context.createGain();
-    master.gain.setValueAtTime(0.72, context.currentTime);
-    master.connect(context.destination);
-    metronomeGainRef.current = master;
-    metronomeRunningRef.current = true;
-    metronomeNextTimeRef.current = context.currentTime + 0.06;
-    metronomeNextBeatRef.current = 0;
-    setIsMetronomeOn(true);
-    setStatus(`메트로놈 재생 중 · ${bpmRef.current} BPM`);
+  const {
+    canvasRef: recordingCanvasRef,
+    destinationRef: recordingDestinationRef,
+    connectedNodesRef: recordingConnectedNodesRef,
+    isRecording,
+    download: recordingDownload,
+    startRecording,
+    stopRecording,
+  } = usePerformanceRecorder({
+    initializeAudioContext,
+    performanceVideos: performanceVideoRefs,
+    performanceAudioSources: performanceAudioSourceRefs,
+    metronomeGain: metronomeGainRef,
+    metronomeConnected: metronomeRecordingConnectedRef,
+    setStatus,
+  });
 
-    const scheduleClick = (time: number, beat: number) => {
-      const oscillator = context.createOscillator();
-      const clickGain = context.createGain();
-      oscillator.frequency.setValueAtTime(beat === 0 ? 1320 : 880, time);
-      clickGain.gain.setValueAtTime(0.0001, time);
-      clickGain.gain.exponentialRampToValueAtTime(beat === 0 ? 0.22 : 0.13, time + 0.002);
-      clickGain.gain.exponentialRampToValueAtTime(0.0001, time + 0.045);
-      oscillator.connect(clickGain);
-      clickGain.connect(master);
-      oscillator.start(time);
-      oscillator.stop(time + 0.05);
-      oscillator.onended = () => {
-        oscillator.disconnect();
-        clickGain.disconnect();
-      };
-
-      const delay = Math.max(0, (time - context.currentTime) * 1000);
-      const visualTimer = window.setTimeout(() => {
-        metronomeVisualTimersRef.current = metronomeVisualTimersRef.current.filter(
-          (timer) => timer !== visualTimer,
-        );
-        if (metronomeRunningRef.current) setMetronomeBeat(beat);
-      }, delay);
-      metronomeVisualTimersRef.current.push(visualTimer);
-    };
-
-    const scheduler = () => {
-      if (!metronomeRunningRef.current) return;
-      while (metronomeNextTimeRef.current < context.currentTime + 0.1) {
-        scheduleClick(metronomeNextTimeRef.current, metronomeNextBeatRef.current);
-        metronomeNextTimeRef.current += 60 / bpmRef.current;
-        metronomeNextBeatRef.current = (metronomeNextBeatRef.current + 1) % 4;
-      }
-      metronomeSchedulerRef.current = window.setTimeout(scheduler, 25);
-    };
-
-    scheduler();
-  }, [initializeAudioContext]);
-
-  const toggleMetronome = () => {
-    if (metronomeRunningRef.current) stopMetronome();
-    else void startMetronome();
-  };
+  const {
+    bpm,
+    isOn: isMetronomeOn,
+    beat: metronomeBeat,
+    setBpm,
+    toggle: toggleMetronome,
+  } = useMetronome({
+    initializeAudioContext,
+    gainRef: metronomeGainRef,
+    recordingDestination: recordingDestinationRef,
+    recordingConnected: metronomeRecordingConnectedRef,
+    setStatus,
+  });
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -286,12 +237,20 @@ function App() {
       triggerGenerationRefs.current[padIndex] += 1;
       performanceVideoRefs.current[padIndex]?.pause();
     });
+    stopAllPadAudio();
     cancelAllVideoCallbacks();
     sourceVideoRef.current?.pause();
 
     const sourceId = crypto.randomUUID();
     const nextUrl = URL.createObjectURL(file);
-    const nextSource: SourceAsset = { id: sourceId, name: file.name, url: nextUrl };
+    const nextSource: SourceAsset = {
+      id: sourceId,
+      name: file.name,
+      url: nextUrl,
+      file,
+      audioBuffer: null,
+      audioDecodePromise: null,
+    };
     sourceAssetsRef.current = [...sourceAssetsRef.current, nextSource];
     captureStartRefs.current = createPadValues(null);
 
@@ -318,6 +277,7 @@ function App() {
       performanceVideoRefs.current[padIndex]?.pause();
       triggerGenerationRefs.current[padIndex] += 1;
     });
+    stopAllPadAudio();
     cancelAllVideoCallbacks();
     loopEnabledRefs.current = createPadValues(false);
     setLoopEnabled(createPadValues(false));
@@ -394,6 +354,9 @@ function App() {
     });
     setActivePad(padIndex);
     prepareSample(padIndex, nextSample);
+    void initializeAudioContext().then((context) => {
+      if (context) void ensureSourceAudio(activeSource, context);
+    });
     setStatus(
       `${padLabel(padIndex)} 저장 완료 · ${formatClock(startedAt)} → ${formatClock(endedAt)}`,
     );
@@ -476,6 +439,7 @@ function App() {
             return;
           }
 
+          stopPadAudio(padIndex);
           setIsPerforming((current) => replaceAt(current, padIndex, false));
           setStatus(`${padLabel(padIndex)} 재생 완료 · 다시 누르면 즉시 재생합니다.`);
           stopFrameRequestRefs.current[padIndex] = null;
@@ -489,7 +453,7 @@ function App() {
       };
       stop();
     },
-    [],
+    [stopPadAudio],
   );
 
   const triggerSample = useCallback(
@@ -506,6 +470,7 @@ function App() {
 
       const generation = ++triggerGenerationRefs.current[padIndex];
       cancelPadVideoCallbacks(padIndex);
+      stopPadAudio(padIndex);
       // Keep the media play request in the original pointer/key event turn.
       // Mobile browsers can reject a second pad when we await AudioContext.resume()
       // before calling play(), because the transient user activation is then lost.
@@ -562,7 +527,42 @@ function App() {
         // Invoke play() before awaiting metadata so mobile Safari/Chrome still
         // associate every finger press with its own media playback request.
         const playRequest = video.play();
-        await Promise.all([playRequest, audioInitialization, metadataReady]);
+        const audioPlayback = Promise.all([audioInitialization, metadataReady]).then(
+          async ([context]) => {
+            if (!context || generation !== triggerGenerationRefs.current[padIndex]) return;
+            const buffer = await ensureSourceAudio(source, context);
+            if (!buffer || generation !== triggerGenerationRefs.current[padIndex]) return;
+
+            const bufferSource = context.createBufferSource();
+            const shouldLoop = loopEnabledRefs.current[padIndex];
+            const safeIn = Math.min(
+              sample.inSeconds,
+              Math.max(0, buffer.duration - 0.001),
+            );
+            const safeOut = Math.min(sample.outSeconds, buffer.duration);
+            if (safeOut <= safeIn) return;
+            const offset = Math.min(
+              Math.max(safeIn, video.currentTime),
+              Math.max(safeIn, safeOut - 0.001),
+            );
+            bufferSource.buffer = buffer;
+            bufferSource.loop = shouldLoop;
+            bufferSource.loopStart = safeIn;
+            bufferSource.loopEnd = safeOut;
+            bufferSource.connect(context.destination);
+            if (recordingDestinationRef.current) {
+              bufferSource.connect(recordingDestinationRef.current);
+              recordingConnectedNodesRef.current.add(bufferSource);
+            }
+            performanceAudioSourceRefs.current[padIndex] = bufferSource;
+            if (shouldLoop) {
+              bufferSource.start(0, offset);
+            } else {
+              bufferSource.start(0, offset, Math.max(0.001, safeOut - offset));
+            }
+          },
+        );
+        await Promise.all([playRequest, audioPlayback, metadataReady]);
         if (generation !== triggerGenerationRefs.current[padIndex]) return;
         if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
           video.pause();
@@ -582,8 +582,10 @@ function App() {
     },
     [
       cancelPadVideoCallbacks,
+      ensureSourceAudio,
       initializeAudioContext,
       samples,
+      stopPadAudio,
       stopPerformanceAtSampleEnd,
     ],
   );
@@ -604,8 +606,12 @@ function App() {
       setStatus(
         `${padLabel(padIndex)} 루프 ON · ${formatDuration(sampleDuration(sample))}마다 반복합니다.`,
       );
-      if (!isPerforming[padIndex]) void triggerSample(padIndex);
+      // Restart the pad so both the muted video and its Web Audio source use
+      // the same loop boundaries immediately.
+      void triggerSample(padIndex);
     } else {
+      const audioSource = performanceAudioSourceRefs.current[padIndex];
+      if (audioSource) audioSource.loop = false;
       setStatus(`${padLabel(padIndex)} 루프 OFF · 현재 재생 후 정지합니다.`);
     }
   };
@@ -646,6 +652,7 @@ function App() {
       performanceVideoRefs.current[padIndex]?.pause();
       triggerGenerationRefs.current[padIndex] += 1;
     });
+    stopAllPadAudio();
     cancelAllVideoCallbacks();
     setIsPerforming(createPadValues(false));
     if (nextMode === "sample") {
@@ -673,6 +680,7 @@ function App() {
     event: ReactPointerEvent<HTMLButtonElement>,
     padIndex: PadIndex,
   ) => {
+    if (event.pointerType === "touch") return;
     event.preventDefault();
     if (mode === "sample") {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -688,6 +696,7 @@ function App() {
     event: ReactPointerEvent<HTMLButtonElement>,
     padIndex: PadIndex,
   ) => {
+    if (event.pointerType === "touch") return;
     event.preventDefault();
     if (
       mode === "sample" &&
@@ -695,6 +704,23 @@ function App() {
     ) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    if (mode === "sample") finishCapture(padIndex);
+  };
+
+  const handlePadTouchStart = (
+    event: ReactTouchEvent<HTMLButtonElement>,
+    padIndex: PadIndex,
+  ) => {
+    event.preventDefault();
+    if (mode === "sample") startCapture(padIndex);
+    else void triggerSample(padIndex);
+  };
+
+  const handlePadTouchEnd = (
+    event: ReactTouchEvent<HTMLButtonElement>,
+    padIndex: PadIndex,
+  ) => {
+    event.preventDefault();
     if (mode === "sample") finishCapture(padIndex);
   };
 
@@ -716,250 +742,82 @@ function App() {
         </div>
         <label className="file-picker">
           <span>{sources.length ? "영상 추가" : "영상 불러오기"}</span>
-          <input type="file" accept="video/*" onChange={handleFileChange} />
+          <input
+            type="file"
+            accept="video/*"
+            onChange={handleFileChange}
+            disabled={isRecording}
+          />
         </label>
       </header>
 
       <section className="mode-switch" aria-label="작업 모드">
-        <button className={mode === "sample" ? "active" : ""} type="button" onClick={() => switchMode("sample")}>
+        <button className={mode === "sample" ? "active" : ""} type="button" onClick={() => switchMode("sample")} disabled={isRecording}>
           <span>01</span>샘플링
         </button>
-        <button className={mode === "perform" ? "active" : ""} type="button" onClick={() => switchMode("perform")}>
+        <button className={mode === "perform" ? "active" : ""} type="button" onClick={() => switchMode("perform")} disabled={isRecording}>
           <span>02</span>연주
         </button>
       </section>
 
       <section className="workstation">
-        <div className="monitor-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="panel-kicker">{mode === "sample" ? "SOURCE MONITOR" : "OUTPUT MONITOR"}</p>
-              <div className="source-heading">
-                <h2>{sourceName || "No source loaded"}</h2>
-                {sources.length > 1 && mode === "sample" && (
-                  <select
-                    className="source-select"
-                    aria-label="샘플링할 소스 영상 선택"
-                    value={activeSourceId ?? ""}
-                    onChange={(event) => selectSource(event.target.value)}
-                  >
-                    {sources.map((source, index) => (
-                      <option key={source.id} value={source.id}>
-                        {String.fromCharCode(65 + index)} · {source.name}
-                      </option>
-                    ))}
-                  </select>
-                )}
-              </div>
-            </div>
-            <div className={`live-indicator ${activeCaptureIndices.length ? "recording" : ""}`}>
-              <span />
-              {activeCaptureIndices.length ? "SAMPLING" : mode === "perform" ? "READY" : "SOURCE"}
-            </div>
-          </div>
+        <MonitorPanel
+          mode={mode}
+          sourceName={sourceName}
+          sourceUrl={sourceUrl}
+          sources={sources}
+          activeSourceId={activeSourceId}
+          activeCaptureIndices={activeCaptureIndices}
+          isRecording={isRecording}
+          duration={duration}
+          sourceTime={sourceTime}
+          currentMonitorTime={currentMonitorTime}
+          activePerformanceCount={activePerformanceCount}
+          isPerforming={isPerforming}
+          isCapturing={isCapturing}
+          captureLengths={captureLengths}
+          samples={samples}
+          selectedSample={selectedSample}
+          sourceVideoRef={sourceVideoRef}
+          performanceVideoRefs={performanceVideoRefs}
+          recordingCanvasRef={recordingCanvasRef}
+          setDuration={setDuration}
+          setSourceTime={setSourceTime}
+          setPerformanceTimes={setPerformanceTimes}
+          setStatus={setStatus}
+          selectSource={selectSource}
+          finishAllCaptures={finishAllCaptures}
+          handleSourceTimeUpdate={handleSourceTimeUpdate}
+          toggleSourcePlayback={toggleSourcePlayback}
+          seekSource={seekSource}
+        />
 
-          <div className={`video-stage ${!sourceUrl ? "empty" : ""}`}>
-            {sourceUrl ? (
-              <>
-                <video
-                  ref={sourceVideoRef}
-                  className={mode === "sample" ? "visible" : "hidden-video"}
-                  src={sourceUrl}
-                  playsInline
-                  preload="auto"
-                  onLoadedMetadata={(event) => {
-                    setDuration(event.currentTarget.duration);
-                    setSourceTime(0);
-                  }}
-                  onTimeUpdate={handleSourceTimeUpdate}
-                  onEnded={() => {
-                    finishAllCaptures();
-                    setStatus("소스 영상 재생이 끝났습니다.");
-                  }}
-                />
-
-                <div className={`performance-grid ${mode === "perform" ? "visible" : "hidden-video"} active-${activePerformanceCount}`}>
-                  {PAD_INDICES.map((padIndex) => (
-                    <video
-                      key={padIndex}
-                      ref={(element) => {
-                        performanceVideoRefs.current[padIndex] = element;
-                      }}
-                      className={isPerforming[padIndex] ? "performance-active" : "performance-idle"}
-                      src={
-                        sources.find(
-                          (source) => source.id === samples[padIndex]?.sourceId,
-                        )?.url
-                      }
-                      playsInline
-                      preload="auto"
-                      onLoadedMetadata={(event) => {
-                        const sample = samples[padIndex];
-                        if (sample) event.currentTarget.currentTime = sample.inSeconds;
-                      }}
-                      onTimeUpdate={(event) => {
-                        const time = event.currentTarget.currentTime;
-                        setPerformanceTimes((current) => replaceAt(current, padIndex, time));
-                      }}
-                    />
-                  ))}
-                  {activePerformanceCount === 0 && (
-                    <div className="output-standby">
-                      <strong>OUTPUT READY</strong>
-                      <p>PAD 01~04 중 하나를 눌러 연주하세요.</p>
-                    </div>
-                  )}
-                </div>
-              </>
-            ) : (
-              <div className="empty-monitor">
-                <span className="empty-icon">＋</span>
-                <strong>로컬 영상을 선택하세요</strong>
-                <p>파일은 서버로 업로드되지 않고 이 브라우저에서만 사용됩니다.</p>
-              </div>
-            )}
-
-            {activeCaptureIndices.length > 0 && (
-              <div className="capture-overlay">
-                <span className="capture-dot" />
-                <strong>{activeCaptureIndices.map(padLabel).join(" + ")}</strong>
-                <b>{formatDuration(Math.max(...activeCaptureIndices.map((index) => captureLengths[index])))}</b>
-              </div>
-            )}
-          </div>
-
-          <div className="transport">
-            <time>{formatClock(currentMonitorTime)}</time>
-            {mode === "sample" ? (
-              <>
-                <button type="button" onClick={() => seekSource(-5)} disabled={!sourceUrl || isCapturing.some(Boolean)} aria-label="5초 뒤로">−5s</button>
-                <button className="play-button" type="button" onClick={() => void toggleSourcePlayback()} disabled={!sourceUrl}>
-                  {sourceVideoRef.current?.paused === false ? "Ⅱ" : "▶"}
-                </button>
-                <button type="button" onClick={() => seekSource(5)} disabled={!sourceUrl || isCapturing.some(Boolean)} aria-label="5초 앞으로">+5s</button>
-                <input
-                  aria-label="소스 영상 탐색"
-                  type="range"
-                  min="0"
-                  max={duration || 0}
-                  step="0.001"
-                  value={sourceTime}
-                  disabled={!sourceUrl || isCapturing.some(Boolean)}
-                  onChange={(event) => {
-                    const video = sourceVideoRef.current;
-                    if (video) video.currentTime = Number(event.target.value);
-                    setSourceTime(Number(event.target.value));
-                  }}
-                />
-              </>
-            ) : (
-              <div className="sample-range" aria-label="선택된 패드 샘플 구간">
-                <span>{selectedSample ? formatClock(selectedSample.inSeconds) : "--:--.---"}</span>
-                <div />
-                <span>{selectedSample ? formatClock(selectedSample.outSeconds) : "--:--.---"}</span>
-              </div>
-            )}
-            <time>{formatClock(mode === "sample" ? duration : selectedSample?.outSeconds ?? 0)}</time>
-          </div>
-        </div>
-
-        <aside className="control-panel">
-          <div className="instruction-block">
-            <p className="panel-kicker">{mode === "sample" ? "CAPTURE PADS" : "PERFORMANCE PADS · RETRIGGER"}</p>
-            <h2>{mode === "sample" ? "장면이 나오는 동안 누르세요" : "네 장면을 자유롭게 연주하세요"}</h2>
-            <p>
-              {mode === "sample"
-                ? "영상을 여러 개 추가하고 소스를 바꿔가며 패드마다 다른 구간을 저장할 수 있습니다."
-                : "네 패드는 독립적으로 겹쳐 재생됩니다. LOOP를 켜면 각 샘플의 IN~OUT 길이로 반복합니다."}
-            </p>
-          </div>
-
-          <div className="metronome-panel">
-            <button className={isMetronomeOn ? "metronome-toggle active" : "metronome-toggle"} type="button" onClick={toggleMetronome} aria-pressed={isMetronomeOn}>
-              <span>{isMetronomeOn ? "■" : "▶"}</span> METRONOME
-            </button>
-            <label className="bpm-control">
-              <span>BPM</span>
-              <input
-                type="number"
-                min="40"
-                max="240"
-                value={bpm}
-                onChange={(event) => {
-                  const next = Math.min(240, Math.max(40, Number(event.target.value) || 40));
-                  bpmRef.current = next;
-                  setBpm(next);
-                }}
-              />
-            </label>
-            <div className="beat-lights" aria-label={`4박자 중 ${metronomeBeat === null ? 0 : metronomeBeat + 1}박`}>
-              {[0, 1, 2, 3].map((beat) => (
-                <span key={beat} className={`${metronomeBeat === beat && isMetronomeOn ? "active" : ""} ${beat === 0 ? "accent" : ""}`} />
-              ))}
-            </div>
-            <p className="loop-station-note">LOOP STATION · SAMPLE LENGTH</p>
-          </div>
-
-          <div className="pad-grid">
-            {PAD_INDICES.map((padIndex) => {
-              const sample = samples[padIndex];
-              return (
-                <div className={`pad-slot ${activePad === padIndex ? "selected" : ""}`} key={padIndex}>
-                  <button
-                    className={`sampler-pad ${isCapturing[padIndex] ? "capturing" : ""} ${isPerforming[padIndex] ? "performing" : ""} ${sample ? "loaded" : ""}`}
-                    type="button"
-                    onPointerDown={(event) => handlePadPointerDown(event, padIndex)}
-                    onPointerUp={(event) => handlePadPointerUp(event, padIndex)}
-                    onPointerCancel={(event) => handlePadPointerUp(event, padIndex)}
-                    onContextMenu={(event) => event.preventDefault()}
-                    aria-label={mode === "sample" ? `${padLabel(padIndex)}, 누르고 있는 동안 영상 구간 수집` : `${padLabel(padIndex)}, 저장된 영상 샘플 재생`}
-                  >
-                    <span className="pad-number">{String(padIndex + 1).padStart(2, "0")}</span>
-                    <span className="pad-state">
-                      {isCapturing[padIndex] ? "CAPTURING" : isPerforming[padIndex] ? "PLAYING" : sample ? "LOADED" : "EMPTY"}
-                    </span>
-                    <strong>
-                      {isCapturing[padIndex]
-                        ? formatDuration(captureLengths[padIndex])
-                        : sample
-                          ? formatDuration(sampleDuration(sample))
-                          : mode === "sample"
-                            ? "HOLD"
-                            : "NO SAMPLE"}
-                    </strong>
-                    <kbd>{PAD_KEYS[padIndex]}</kbd>
-                  </button>
-                  <div className="sample-meta">
-                    <div><span>IN</span><strong>{sample ? formatClock(sample.inSeconds) : "--:--.---"}</strong></div>
-                    <div><span>OUT</span><strong>{sample ? formatClock(sample.outSeconds) : "--:--.---"}</strong></div>
-                  </div>
-                  <div className="pad-utility-row">
-                    <span className="sample-source-name" title={sample?.sourceName}>
-                      {sample?.sourceName ?? "NO SOURCE"}
-                    </span>
-                    <button
-                      className={loopEnabled[padIndex] ? "loop-toggle active" : "loop-toggle"}
-                      type="button"
-                      onClick={() => toggleSampleLoop(padIndex)}
-                      disabled={!sample || mode !== "perform"}
-                      aria-pressed={loopEnabled[padIndex]}
-                    >
-                      LOOP {loopEnabled[padIndex] ? "ON" : "OFF"}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <button className="undo-button" type="button" onClick={undoOverwrite} disabled={!undoEntryRef.current}>
-            ↶ 마지막 덮어쓰기 취소
-          </button>
-          <div className="status-line" role="status" aria-live="polite">
-            <span className={isCapturing.some(Boolean) || isPerforming.some(Boolean) ? "pulse" : ""} />
-            {status}
-          </div>
-        </aside>
+        <ControlPanel
+          mode={mode}
+          bpm={bpm}
+          isMetronomeOn={isMetronomeOn}
+          metronomeBeat={metronomeBeat}
+          isRecording={isRecording}
+          recordingDownload={recordingDownload}
+          samples={samples}
+          isCapturing={isCapturing}
+          isPerforming={isPerforming}
+          captureLengths={captureLengths}
+          loopEnabled={loopEnabled}
+          activePad={activePad}
+          canUndo={Boolean(undoEntryRef.current)}
+          status={status}
+          setBpm={setBpm}
+          toggleMetronome={toggleMetronome}
+          startRecording={startRecording}
+          stopRecording={stopRecording}
+          onPointerDown={handlePadPointerDown}
+          onPointerUp={handlePadPointerUp}
+          onTouchStart={handlePadTouchStart}
+          onTouchEnd={handlePadTouchEnd}
+          onToggleLoop={toggleSampleLoop}
+          onUndo={undoOverwrite}
+        />
       </section>
 
       <section className="latency-panel" aria-labelledby="latency-title">
